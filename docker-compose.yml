@@ -1,0 +1,12 @@
+services:
+  trainwaited-bot:
+    build: .
+    container_name: trainwaited-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    environment:
+      - SUBSCRIPTIONS_FILE=/app/data/subscriptions.json
+      - HEADLESS=true
