@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 import uuid
 from datetime import datetime
 
@@ -18,22 +19,46 @@ def load_subscriptions() -> None:
     if os.path.exists(SUBSCRIPTIONS_FILE):
         try:
             with open(SUBSCRIPTIONS_FILE, encoding="utf-8") as f:
-                subscriptions = json.load(f)
+                loaded = json.load(f)
+            if not isinstance(loaded, dict) or any(
+                not isinstance(user_id, str) or not isinstance(user_subs, list)
+                for user_id, user_subs in loaded.items()
+            ):
+                raise ValueError("Subscriptions file must contain a user-to-subscriptions object")
+            subscriptions = loaded
             cleanup_expired()
             logging.info("Подписки загружены из %s", SUBSCRIPTIONS_FILE)
-        except Exception as e:
-            logging.error("Ошибка загрузки подписок: %s", e)
-            subscriptions = {}
+        except (OSError, json.JSONDecodeError, ValueError):
+            logging.exception("Не удалось прочитать подписки из %s", SUBSCRIPTIONS_FILE)
+            raise
     else:
         subscriptions = {}
 
 
 def save_subscriptions() -> None:
+    directory = os.path.dirname(os.path.abspath(SUBSCRIPTIONS_FILE))
+    temp_path = None
     try:
-        with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=".subscriptions-",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            temp_path = f.name
             json.dump(subscriptions, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.error("Ошибка сохранения подписок: %s", e)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, SUBSCRIPTIONS_FILE)
+    except OSError:
+        logging.exception("Ошибка сохранения подписок в %s", SUBSCRIPTIONS_FILE)
+        raise
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def get_user_subs(user_id: int | str) -> list[dict]:
@@ -77,6 +102,8 @@ def create_subscription(
     departure: str = "",
     arrival: str = "",
     duration: str = "",
+    car_type: str | None = None,
+    seat_filter: str | None = None,
 ) -> dict:
     sub = {
         "id": str(uuid.uuid4())[:8],
@@ -87,6 +114,8 @@ def create_subscription(
         "departure": departure,
         "arrival": arrival,
         "duration": duration,
+        "car_type": car_type,
+        "seat_filter": seat_filter,
         "notified": False,
         "first_check_done": False,
         "created_at": datetime.now().isoformat(timespec="seconds"),

@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
+from html import escape
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
-from config import POPULAR_STATIONS
+from config import CHECK_INTERVAL, POPULAR_STATIONS
 
 # --- Reply keyboard ---
 
@@ -91,16 +92,104 @@ def trains_keyboard(trains: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+SEAT_FILTER_LABELS = {
+    None: "любые билеты",
+    "any": "любые билеты",
+    "lower": "плацкарт · нижнее",
+    "lower_any": "плацкарт · любое нижнее",
+    "lower_side": "плацкарт · нижнее боковое",
+    "upper": "плацкарт · верхнее",
+    "upper_any": "плацкарт · любое верхнее",
+    "upper_side": "плацкарт · верхнее боковое",
+    "side_any": "плацкарт · любое боковое",
+}
+
+
+def seat_preference_keyboard(train_idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🎫 Любые билеты", callback_data=f"pref_any_{train_idx}")],
+            [InlineKeyboardButton("🛏 Плацкарт — любые", callback_data=f"pref_platzkart_{train_idx}")],
+            [InlineKeyboardButton("🛋 Купе — любые", callback_data=f"pref_coupe_{train_idx}")],
+            [
+                InlineKeyboardButton(
+                    "🛏 Плацкарт — нижнее",
+                    callback_data=f"pref_lower_{train_idx}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🛏 Плацкарт — любое нижнее",
+                    callback_data=f"pref_lower_any_{train_idx}",
+                )
+            ],
+            [InlineKeyboardButton("🛏 Плацкарт — верхнее", callback_data=f"pref_upper_{train_idx}")],
+            [
+                InlineKeyboardButton(
+                    "🛏 Плацкарт — любое верхнее",
+                    callback_data=f"pref_upper_any_{train_idx}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🛏 Плацкарт — нижнее боковое",
+                    callback_data=f"pref_lower_side_{train_idx}",
+                )
+            ],
+            [InlineKeyboardButton("🛏 Плацкарт — верхнее боковое", callback_data=f"pref_upper_side_{train_idx}")],
+            [InlineKeyboardButton("🛏 Плацкарт — любое боковое", callback_data=f"pref_side_any_{train_idx}")],
+            [InlineKeyboardButton("◀️ Назад к поездам", callback_data="back_to_trains")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_search")],
+        ]
+    )
+
+
+def parse_preference(data: str) -> tuple[str | None, str | None, str | None]:
+    if data.startswith("pref_any_"):
+        return None, None, data.removeprefix("pref_any_")
+    if data.startswith("pref_platzkart_"):
+        return "platzkart", None, data.removeprefix("pref_platzkart_")
+    if data.startswith("pref_coupe_"):
+        return "coupe", None, data.removeprefix("pref_coupe_")
+    for preference in (
+        "lower_any",
+        "upper_any",
+        "lower_side",
+        "upper_side",
+        "side_any",
+        "lower",
+        "upper",
+    ):
+        prefix = f"pref_{preference}_"
+        if data.startswith(prefix):
+            return "platzkart", preference, data.removeprefix(prefix)
+    return None, None, None
+
+
+def preference_label(sub: dict) -> str:
+    seat_filter = sub.get("seat_filter")
+    car_type = sub.get("car_type")
+    if not seat_filter and not car_type:
+        return "🎫 любые билеты"
+    if seat_filter:
+        return f"🎯 {SEAT_FILTER_LABELS.get(seat_filter, escape(str(seat_filter)))}"
+    if car_type == "platzkart":
+        return "🛏 плацкарт"
+    if car_type == "coupe":
+        return "🛋 купе"
+    return "🎫 фильтр активен"
+
+
 def format_trains_list(trains: list[dict]) -> str:
     lines = []
     for i, t in enumerate(trains, 1):
         dep = t.get("departure") or "??:??"
         arr = t.get("arrival") or "??:??"
-        line = f"{i}. <b>{dep} → {arr}</b>"
+        line = f"{i}. <b>{escape(str(dep))} → {escape(str(arr))}</b>"
         if t.get("duration"):
-            line += f" ({t['duration']})"
+            line += f" ({escape(str(t['duration']))})"
         if t.get("number"):
-            line += f" · №{t['number']}"
+            line += f" · №{escape(str(t['number']))}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -176,9 +265,9 @@ WELCOME_TEXT = (
     "когда места появляются.\n\n"
     "<b>Как это работает:</b>\n"
     "1️⃣ Укажите станции отправления и прибытия\n"
-    "2️⃣ Выберите дату и поезд\n"
-    "3️⃣ Получите уведомление, когда билеты появятся\n\n"
-    "Проверка — каждые 60 секунд. Нажмите кнопку ниже, чтобы начать 👇"
+    "2️⃣ Выберите дату, поезд и тип места\n"
+    "3️⃣ Получите уведомление, когда подходящие билеты появятся\n\n"
+    f"Проверка — каждые {CHECK_INTERVAL} секунд. Нажмите кнопку ниже, чтобы начать 👇"
 )
 
 HELP_TEXT = (
@@ -193,6 +282,7 @@ HELP_TEXT = (
     "• Пишите станции как на сайте БЖД (например: <i>Минск-Пассажирский</i>)\n"
     "• Можно выбрать популярную станцию кнопкой\n"
     "• После создания подписки бот сразу делает первую проверку\n"
+    "• Можно следить за конкретным типом места (например, нижнее в плацкарте)\n"
     "• Уведомление придёт один раз, когда билеты появятся\n"
     "• Просроченные подписки удаляются автоматически"
 )
@@ -211,16 +301,17 @@ def format_subscription(sub: dict) -> str:
     dep = sub.get("departure")
     arr = sub.get("arrival")
     if dep and arr:
-        time_line = f"🕐 <b>{dep} → {arr}</b>"
+        time_line = f"🕐 <b>{escape(str(dep))} → {escape(str(arr))}</b>"
         if sub.get("duration"):
-            time_line += f" ({sub['duration']})"
-        time_line += f" · №{sub['train']}"
+            time_line += f" ({escape(str(sub['duration']))})"
+        time_line += f" · №{escape(str(sub['train']))}"
     else:
-        time_line = f"🚂 Поезд <b>{sub['train']}</b>"
+        time_line = f"🚂 Поезд <b>{escape(str(sub['train']))}</b>"
     return (
         f"🆔 <code>{sub['id']}</code>\n"
         f"{time_line} · {sub['date'].replace('-', '.')}\n"
-        f"📍 {sub['from']} → {sub['to']}\n"
+        f"📍 {escape(str(sub['from']))} → {escape(str(sub['to']))}\n"
+        f"{preference_label(sub)}\n"
         f"🔔 {status}"
     )
 
@@ -239,20 +330,24 @@ def format_subscription_created(sub: dict, date_display: str) -> str:
     dep = sub.get("departure")
     arr = sub.get("arrival")
     if dep and arr:
-        schedule = f"🕐 Отправление: <b>{dep}</b> → прибытие <b>{arr}</b>"
+        schedule = (
+            f"🕐 Отправление: <b>{escape(str(dep))}</b> → "
+            f"прибытие <b>{escape(str(arr))}</b>"
+        )
         if sub.get("duration"):
-            schedule += f" ({sub['duration']})"
-        schedule += f"\n🚂 Поезд №<b>{sub['train']}</b>"
+            schedule += f" ({escape(str(sub['duration']))})"
+        schedule += f"\n🚂 Поезд №<b>{escape(str(sub['train']))}</b>"
     else:
-        schedule = f"🚂 Поезд: <b>{sub['train']}</b>"
+        schedule = f"🚂 Поезд: <b>{escape(str(sub['train']))}</b>"
     return (
         f"✅ <b>Подписка создана!</b>\n\n"
-        f"🆔 ID: <code>{sub['id']}</code>\n"
+        f"🆔 ID: <code>{escape(str(sub['id']))}</code>\n"
         f"{schedule}\n"
         f"📅 Дата: <b>{date_display}</b>\n"
-        f"📍 Маршрут: <b>{sub['from']}</b> → <b>{sub['to']}</b>\n\n"
-        f"⏰ Автопроверка каждые 60 сек\n"
-        f"🔔 Уведомлю, как только появятся билеты!"
+        f"📍 Маршрут: <b>{escape(str(sub['from']))}</b> → <b>{escape(str(sub['to']))}</b>\n"
+        f"🎯 Отслеживаю: <b>{preference_label(sub).replace('🎯 ', '').replace('🎫 ', '')}</b>\n\n"
+        f"⏰ Автопроверка каждые {CHECK_INTERVAL} сек\n"
+        f"🔔 Уведомлю, как только появятся подходящие билеты!"
     )
 
 
@@ -263,19 +358,36 @@ def format_tickets_message(
     url: str,
     departure: str = "",
     arrival: str = "",
+    seat_filter: str | None = None,
+    matched_seats: int | None = None,
+    seats: dict | None = None,
 ) -> str:
     date_display = date.replace("-", ".")
     if departure and arrival:
-        header = f"🔥 <b>БИЛЕТЫ ПОЯВИЛИСЬ!</b>\n🕐 <b>{departure} → {arrival}</b> · №{train_num} · {date_display}\n"
+        header = f"🔥 <b>БИЛЕТЫ ПОЯВИЛИСЬ!</b>\n🕐 <b>{escape(departure)} → {escape(arrival)}</b> · №{escape(train_num)} · {date_display}\n"
     else:
-        header = f"🔥 <b>БИЛЕТЫ ПОЯВИЛИСЬ!</b>\n🚂 Поезд <b>{train_num}</b> · {date_display}\n"
+        header = f"🔥 <b>БИЛЕТЫ ПОЯВИЛИСЬ!</b>\n🚂 Поезд <b>{escape(train_num)}</b> · {date_display}\n"
     lines = [header]
+
+    if seat_filter and seat_filter != "any" and matched_seats:
+        label = SEAT_FILTER_LABELS.get(seat_filter, seat_filter)
+        lines.append(f"🎯 Найдено <b>{matched_seats}</b> мест: {label}")
+
     for item in items:
-        line = f"• {item['type']}: <b>{item['quantity']}</b> мест"
+        line = f"• {escape(str(item['type']))}: <b>{escape(str(item['quantity']))}</b> мест"
         if item.get("price"):
-            line += f" — от {item['price']} BYN"
+            line += f" — от {escape(str(item['price']))} BYN"
         lines.append(line)
-    lines.append(f"\n🔗 <a href='{url}'>Открыть на pass.rw.by</a>")
+
+    if seats:
+        detail = []
+        for label, count in sorted(seats.items()):
+            if count:
+                detail.append(f"{escape(str(label))}: {escape(str(count))}")
+        if detail:
+            lines.append("📊 " + " · ".join(detail))
+
+    lines.append(f"\n🔗 <a href='{escape(url, quote=True)}'>Открыть на pass.rw.by</a>")
     return "\n".join(lines)
 
 

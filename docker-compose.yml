@@ -6,7 +6,11 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
+      - trainwaited-data:/app/data
     environment:
       - SUBSCRIPTIONS_FILE=/app/data/subscriptions.json
       - HEADLESS=true
+      - BROWSER=firefox
+
+volumes:
+  trainwaited-data:

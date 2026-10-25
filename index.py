@@ -1,8 +1,10 @@
 import asyncio
+from html import escape
 import logging
 from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -14,7 +16,12 @@ from telegram.ext import (
 )
 
 from config import CHECK_INTERVAL, TOKEN
-from scraper import check_tickets, fetch_trains_list
+from scraper import (
+    RailwayVerificationError,
+    check_tickets,
+    close_browser,
+    fetch_trains_list,
+)
 import storage
 from storage import (
     active_subscriptions,
@@ -41,8 +48,11 @@ from ui import (
     format_tickets_message,
     format_trains_list,
     main_menu_keyboard,
+    parse_preference,
     popular_stations_keyboard,
+    preference_label,
     retry_keyboard,
+    seat_preference_keyboard,
     station_by_index,
     subscription_created_keyboard,
     subscriptions_list_keyboard,
@@ -51,7 +61,7 @@ from ui import (
     trains_keyboard,
 )
 
-FROM_STATION, TO_STATION, DATE, SELECT_TRAIN = range(4)
+FROM_STATION, TO_STATION, DATE, SELECT_TRAIN, SELECT_PREFERENCE = range(5)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +69,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("selenium").setLevel(logging.WARNING)
 logging.getLogger("WDM").setLevel(logging.WARNING)
 
@@ -71,7 +83,10 @@ async def send_or_edit(update: Update, text: str, reply_markup=None, parse_mode=
         query = update.callback_query
         try:
             await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except Exception:
+        except BadRequest as error:
+            if "message is not modified" in str(error).lower():
+                return
+            logging.warning("Could not edit Telegram message; sending a new one: %s", error)
             await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     elif update.message:
         await update.message.reply_text(
@@ -144,7 +159,7 @@ async def get_from_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     from_st = context.user_data["from_station"]
     text = (
-        f"✅ Отправление: <b>{from_st}</b>\n\n"
+        f"✅ Отправление: <b>{escape(from_st)}</b>\n\n"
         f"📍 <b>Шаг 2 из 3</b> — станция прибытия\n"
         "Выберите из списка или введите вручную:"
     )
@@ -161,7 +176,7 @@ async def get_from_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_to_station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from_st = context.user_data.get("from_station", "—")
     text = (
-        f"✅ Отправление: <b>{from_st}</b>\n\n"
+        f"✅ Отправление: <b>{escape(from_st)}</b>\n\n"
         f"📍 <b>Шаг 2 из 3</b> — станция прибытия\n"
         "Выберите из списка или введите вручную:"
     )
@@ -198,7 +213,7 @@ async def get_to_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     to_st = context.user_data["to_station"]
     text = (
-        f"✅ Прибытие: <b>{to_st}</b>\n\n"
+        f"✅ Прибытие: <b>{escape(to_st)}</b>\n\n"
         f"📅 <b>Шаг 3 из 3</b> — дата поездки\n"
         "Выберите дату кнопкой или введите в формате <b>ДД.ММ.ГГГГ</b>:"
     )
@@ -218,8 +233,9 @@ async def process_date_and_search(update: Update, context: ContextTypes.DEFAULT_
 
     wait_text = (
         f"🔍 Ищу поезда на <b>{date_display}</b>\n"
-        f"📍 {context.user_data['from_station']} → {context.user_data['to_station']}\n\n"
-        "⏳ Это может занять до 40 секунд..."
+        f"📍 {escape(context.user_data['from_station'])} → "
+        f"{escape(context.user_data['to_station'])}\n\n"
+        "⏳ Это может занять до 25 секунд..."
     )
 
     if update.callback_query:
@@ -227,11 +243,31 @@ async def process_date_and_search(update: Update, context: ContextTypes.DEFAULT_
     else:
         wait_msg = await update.message.reply_text(wait_text, parse_mode="HTML")
 
-    trains = await fetch_trains_list(
-        context.user_data["from_station"],
-        context.user_data["to_station"],
-        date_str,
-    )
+    try:
+        trains = await fetch_trains_list(
+            context.user_data["from_station"],
+            context.user_data["to_station"],
+            date_str,
+        )
+    except RailwayVerificationError:
+        verification_text = (
+            "⚠️ Сайт БЖД временно показывает проверочную страницу, "
+            "поэтому сейчас не удалось загрузить расписание.\n\n"
+            "Подписка не создана. Подождите немного и попробуйте ещё раз."
+        )
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                verification_text,
+                reply_markup=retry_keyboard(),
+                parse_mode="HTML",
+            )
+        else:
+            await wait_msg.edit_text(
+                verification_text,
+                reply_markup=retry_keyboard(),
+                parse_mode="HTML",
+            )
+        return ConversationHandler.END
 
     context.user_data["trains_found"] = trains
 
@@ -339,6 +375,64 @@ async def select_train(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     train_info = trains[train_idx]
+    context.user_data["selected_train_idx"] = train_idx
+    dep = train_info.get("departure") or "??:??"
+    arr = train_info.get("arrival") or "??:??"
+    text = (
+        f"🎯 <b>Шаг 4 — что отслеживать?</b>\n\n"
+        f"🚂 Поезд №<b>{escape(train_info['number'])}</b>\n"
+        f"🕐 {escape(dep)} → {escape(arr)}\n\n"
+        "Выберите тип мест, за которым следить:"
+    )
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=seat_preference_keyboard(train_idx),
+    )
+    return SELECT_PREFERENCE
+
+
+async def select_preference(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "cancel_search":
+        return await show_main_menu(update, context)
+    if data == "back_to_trains":
+        trains = context.user_data.get("trains_found", [])
+        date_display = context.user_data.get("date_display", "")
+        text = (
+            f"📋 Найдено <b>{len(trains)}</b> поездов на {date_display}\n\n"
+            f"{format_trains_list(trains)}\n\n"
+            "Выберите рейс по времени отправления:"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=trains_keyboard(trains),
+            parse_mode="HTML",
+        )
+        return SELECT_TRAIN
+
+    car_type, seat_filter, idx_str = parse_preference(data)
+    if idx_str is None:
+        return SELECT_PREFERENCE
+
+    try:
+        train_idx = int(idx_str)
+    except ValueError:
+        await query.edit_message_text("❌ Неверный выбор.", reply_markup=retry_keyboard())
+        return ConversationHandler.END
+
+    trains = context.user_data.get("trains_found", [])
+    if train_idx < 0 or train_idx >= len(trains):
+        await query.edit_message_text(
+            "❌ Список поездов устарел. Начните поиск заново.",
+            reply_markup=retry_keyboard(),
+        )
+        return ConversationHandler.END
+
+    train_info = trains[train_idx]
     train_num = train_info["number"]
     user_id = query.from_user.id
     from_st = context.user_data["from_station"]
@@ -355,6 +449,8 @@ async def select_train(update: Update, context: ContextTypes.DEFAULT_TYPE):
         departure=train_info.get("departure", ""),
         arrival=train_info.get("arrival", ""),
         duration=train_info.get("duration", ""),
+        car_type=car_type,
+        seat_filter=seat_filter,
     )
 
     await query.edit_message_text(
@@ -363,7 +459,10 @@ async def select_train(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=subscription_created_keyboard(sub["id"]),
     )
 
-    await check_single_subscription(context, user_id, sub, is_first_check=True)
+    context.application.create_task(
+        check_single_subscription(context, user_id, sub, is_first_check=True),
+        update=update,
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -377,8 +476,17 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
 
     logging.info("Проверка: поезд %s, дата %s, подписка %s, user %s", train_num, date, sub_id, user_id)
 
-    result = await check_tickets(from_st, to_st, date, train_num)
+    result = await check_tickets(
+        from_st,
+        to_st,
+        date,
+        train_num,
+        car_type=sub.get("car_type"),
+        seat_filter=sub.get("seat_filter"),
+    )
     status = result["status"]
+    schedule = train_schedule_label(sub)
+    pref = preference_label(sub)
 
     if status == "page_error":
         if is_first_check:
@@ -393,7 +501,7 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
         if is_first_check:
             await context.bot.send_message(
                 user_id,
-                f"❌ Поезд <b>{train_num}</b> не найден на эту дату.",
+                f"❌ Поезд <b>{escape(train_num)}</b> не найден на эту дату.",
                 parse_mode="HTML",
                 reply_markup=MAIN_KEYBOARD,
             )
@@ -409,11 +517,11 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
         return
 
     if status == "no_tickets":
-        schedule = train_schedule_label(sub)
         if is_first_check:
             await context.bot.send_message(
                 user_id,
-                f"ℹ️ Билетов на рейс <b>{schedule}</b> ({date.replace('-', '.')}) пока нет.\n"
+                f"ℹ️ Билетов на рейс <b>{escape(schedule)}</b> ({date.replace('-', '.')}) пока нет.\n"
+                f"Отслеживаю: {pref}\n"
                 f"Продолжаю следить — уведомлю, когда появятся!",
                 parse_mode="HTML",
                 reply_markup=MAIN_KEYBOARD,
@@ -422,7 +530,28 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
             storage.save_subscriptions()
         if edit_message:
             await edit_message.edit_text(
-                f"ℹ️ Билетов на поезд <b>{train_num}</b> пока нет.\nПродолжаю следить...",
+                f"ℹ️ Билетов на поезд <b>{escape(train_num)}</b> пока нет.\nПродолжаю следить...",
+                parse_mode="HTML",
+                reply_markup=subscriptions_list_keyboard(get_user_subs(user_id)),
+            )
+        return
+
+    if status == "no_matching_seats":
+        if is_first_check:
+            await context.bot.send_message(
+                user_id,
+                f"ℹ️ На рейс <b>{escape(schedule)}</b> ({date.replace('-', '.')}) билеты есть, "
+                f"но нужных мест пока нет.\n"
+                f"Отслеживаю: {pref}\n"
+                f"Продолжаю следить!",
+                parse_mode="HTML",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            sub["first_check_done"] = True
+            storage.save_subscriptions()
+        if edit_message:
+            await edit_message.edit_text(
+                f"ℹ️ Нужных мест ({pref}) пока нет.\nПродолжаю следить...",
                 parse_mode="HTML",
                 reply_markup=subscriptions_list_keyboard(get_user_subs(user_id)),
             )
@@ -436,6 +565,9 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
             result["url"],
             departure=sub.get("departure", ""),
             arrival=sub.get("arrival", ""),
+            seat_filter=sub.get("seat_filter"),
+            matched_seats=result.get("matched_seats"),
+            seats=result.get("seats"),
         )
         await context.bot.send_message(
             chat_id=user_id,
@@ -457,9 +589,26 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
 
 async def background_checker(context: ContextTypes.DEFAULT_TYPE):
     cleanup_expired()
-    for uid, sub in active_subscriptions():
-        await check_single_subscription(context, int(uid), sub, is_first_check=False)
-        await asyncio.sleep(1)
+    subs = list(active_subscriptions())
+    for i in range(0, len(subs), 3):
+        batch = subs[i : i + 3]
+        results = await asyncio.gather(
+            *[
+                check_single_subscription(context, int(uid), sub, is_first_check=False)
+                for uid, sub in batch
+            ],
+            return_exceptions=True,
+        )
+        for (uid, sub), result in zip(batch, results):
+            if isinstance(result, Exception):
+                logging.error(
+                    "Subscription check failed for subscription %s (user %s)",
+                    sub.get("id"),
+                    uid,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+        if i + 3 < len(subs):
+            await asyncio.sleep(0.5)
 
 
 async def show_user_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -506,7 +655,7 @@ async def handle_button_callback(update: Update, context: ContextTypes.DEFAULT_T
         if not sub:
             await query.edit_message_text("❌ Подписка не найдена.", reply_markup=main_menu_keyboard())
             return
-        msg = await query.edit_message_text("🔍 Проверяю билеты... Подождите до 30 сек.")
+        msg = await query.edit_message_text("🔍 Проверяю билеты... Подождите до 25 сек.")
         await check_single_subscription(context, user_id, sub, is_first_check=True, edit_message=msg)
         return
 
@@ -517,7 +666,7 @@ async def handle_button_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("❌ Подписка не найдена.")
             return
         await query.edit_message_text(
-            f"🗑 Удалить подписку <b>{train_schedule_label(sub)}</b> "
+            f"🗑 Удалить подписку <b>{escape(train_schedule_label(sub))}</b> "
             f"({sub['date'].replace('-', '.')})?",
             parse_mode="HTML",
             reply_markup=delete_confirm_keyboard(sub_id),
@@ -552,12 +701,25 @@ async def post_init(application: Application):
     await application.bot.set_my_commands(BOT_COMMANDS)
 
 
+async def post_shutdown(application: Application):
+    await close_browser()
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logging.error("Exception while handling update: %s", context.error, exc_info=context.error)
+    logging.error("Exception while handling update", exc_info=context.error)
 
 
 def main():
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set. Add it to the environment or .env file.")
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -582,6 +744,12 @@ def main():
             SELECT_TRAIN: [
                 CallbackQueryHandler(select_train, pattern="^(select_train_|back_to_date|cancel_search)"),
             ],
+            SELECT_PREFERENCE: [
+                CallbackQueryHandler(
+                    select_preference,
+                    pattern="^(pref_|back_to_trains|cancel_search)",
+                ),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -603,7 +771,12 @@ def main():
     app.add_error_handler(error_handler)
 
     if app.job_queue:
-        app.job_queue.run_repeating(background_checker, interval=CHECK_INTERVAL, first=15)
+        app.job_queue.run_repeating(
+            background_checker,
+            interval=CHECK_INTERVAL,
+            first=15,
+            job_kwargs={"max_instances": 1},
+        )
 
     print("TrainWaited bot started")
     app.run_polling(drop_pending_updates=True)
