@@ -1,7 +1,11 @@
 import os
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+TIMEZONE = ZoneInfo("Europe/Minsk")
 
 TOKEN = os.getenv("BOT_TOKEN")
 

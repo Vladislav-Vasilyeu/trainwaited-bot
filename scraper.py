@@ -21,10 +21,31 @@ class RailwayVerificationError(RuntimeError):
     pass
 
 
+class StationLookupError(RuntimeError):
+    pass
+
+
 CAR_TYPE_CODES = {
     "platzkart": "3",
     "coupe": "4",
 }
+
+
+def parse_station_suggestions(raw_suggestions: object) -> list[dict[str, str]]:
+    if not isinstance(raw_suggestions, list):
+        raise StationLookupError("Railway site returned invalid station suggestions")
+
+    suggestions = []
+    for item in raw_suggestions:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        value = str(item.get("value") or "").strip()
+        exp = str(item.get("exp") or "").strip()
+        if label and value and exp:
+            suggestions.append({"label": label, "value": value, "exp": exp})
+    return suggestions
+
 
 async def get_context():
     global _playwright, _browser, _context, _browser_lock
@@ -74,13 +95,42 @@ async def close_browser():
                     _playwright = None
 
 
-def _route_url(from_station: str, to_station: str, date: str) -> str:
-    query = urlencode({"from": from_station, "to": to_station, "date": date})
+def _route_url(
+    from_station: str,
+    to_station: str,
+    date: str,
+    from_exp: str | None = None,
+    to_exp: str | None = None,
+) -> str:
+    params = {"from": from_station, "to": to_station, "date": date}
+    if from_exp:
+        params["from_exp"] = from_exp
+    if to_exp:
+        params["to_exp"] = to_exp
+    query = urlencode(params)
     return f"https://pass.rw.by/ru/route/?{query}"
 
 
-def _cache_key(from_station, to_station, date, train_num, car_type, seat_filter):
-    return (from_station, to_station, date, train_num, car_type or "", seat_filter or "")
+def _cache_key(
+    from_station,
+    to_station,
+    date,
+    train_num,
+    car_type,
+    seat_filter,
+    from_exp=None,
+    to_exp=None,
+):
+    return (
+        from_station,
+        to_station,
+        date,
+        train_num,
+        car_type or "",
+        seat_filter or "",
+        from_exp or "",
+        to_exp or "",
+    )
 
 
 def count_matching_seats(seats: dict[str, int], seat_filter: str | None) -> int:
@@ -137,6 +187,71 @@ async def _wait_for_schedule(page) -> None:
         )
     except PlaywrightTimeout:
         await page.wait_for_timeout(1500)
+
+
+async def search_stations(query: str) -> list[dict[str, str]]:
+    query = query.strip()
+    if len(query) < 2:
+        return []
+
+    page = None
+    try:
+        async with _semaphore:
+            context = await get_context()
+            page = await context.new_page()
+            await page.goto(
+                "https://pass.rw.by/ru/route/",
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+            if (await page.title()).strip().casefold() == "verification":
+                raise RailwayVerificationError(
+                    "Railway website returned a verification page"
+                )
+
+            selector = "#one-way-raspFormFromTitle"
+            await page.locator(selector).fill(query)
+            try:
+                await page.wait_for_function(
+                    """selector => {
+                        const input = document.querySelector(selector);
+                        const $ = window.jQuery;
+                        const widget = input && $ && $(input).autocomplete("instance");
+                        return widget && widget.term === input.value && widget.pending === 0;
+                    }""",
+                    arg=selector,
+                    timeout=10000,
+                )
+            except PlaywrightTimeout as error:
+                if (await page.title()).strip().casefold() == "verification":
+                    raise RailwayVerificationError(
+                        "Railway website returned a verification page"
+                    ) from error
+                raise StationLookupError(
+                    "Railway station suggestions did not finish loading"
+                ) from error
+
+            raw_suggestions = await page.evaluate(
+                """selector => {
+                    const $ = window.jQuery;
+                    const widget = $(selector).autocomplete("instance");
+                    return widget.menu.element
+                        .find("li.ui-menu-item")
+                        .map((_, element) => $(element).data("ui-autocomplete-item"))
+                        .get()
+                        .filter(Boolean);
+                }""",
+                selector,
+            )
+            return parse_station_suggestions(raw_suggestions)
+    except (RailwayVerificationError, StationLookupError):
+        raise
+    except Exception as error:
+        logging.warning("Station lookup failed: %s", type(error).__name__)
+        raise StationLookupError("Could not load railway station suggestions") from error
+    finally:
+        if page:
+            await page.close()
 
 
 async def _get_text(element, selector: str) -> str:
@@ -250,8 +365,10 @@ async def _check_tickets_sync(
     car_type: str | None = None,
     seat_filter: str | None = None,
     retries: int = 3,
+    from_exp: str | None = None,
+    to_exp: str | None = None,
 ) -> dict:
-    url = _route_url(from_station, to_station, date)
+    url = _route_url(from_station, to_station, date, from_exp, to_exp)
     car_type_code = CAR_TYPE_CODES.get(car_type or "")
 
     for attempt in range(1, retries + 1):
@@ -324,9 +441,14 @@ async def _check_tickets_sync(
 
 
 async def _fetch_trains_sync(
-    from_station: str, to_station: str, date: str, retries: int = 3
+    from_station: str,
+    to_station: str,
+    date: str,
+    retries: int = 3,
+    from_exp: str | None = None,
+    to_exp: str | None = None,
 ) -> list:
-    url = _route_url(from_station, to_station, date)
+    url = _route_url(from_station, to_station, date, from_exp, to_exp)
 
     for attempt in range(1, retries + 1):
         page = None
@@ -359,9 +481,23 @@ async def _fetch_trains_sync(
     return []
 
 
-async def fetch_trains_list(from_station: str, to_station: str, date: str, retries: int = 3):
+async def fetch_trains_list(
+    from_station: str,
+    to_station: str,
+    date: str,
+    retries: int = 3,
+    from_exp: str | None = None,
+    to_exp: str | None = None,
+):
     async with _semaphore:
-        return await _fetch_trains_sync(from_station, to_station, date, retries)
+        return await _fetch_trains_sync(
+            from_station,
+            to_station,
+            date,
+            retries,
+            from_exp=from_exp,
+            to_exp=to_exp,
+        )
 
 
 async def check_tickets(
@@ -371,8 +507,12 @@ async def check_tickets(
     train_num: str,
     car_type: str | None = None,
     seat_filter: str | None = None,
+    from_exp: str | None = None,
+    to_exp: str | None = None,
 ):
-    key = _cache_key(from_station, to_station, date, train_num, car_type, seat_filter)
+    key = _cache_key(
+        from_station, to_station, date, train_num, car_type, seat_filter, from_exp, to_exp
+    )
     now = time.monotonic()
     if len(_cache) > 1000:
         for cached_key, (cached_at, _) in list(_cache.items()):
@@ -390,6 +530,8 @@ async def check_tickets(
             train_num,
             car_type=car_type,
             seat_filter=seat_filter,
+            from_exp=from_exp,
+            to_exp=to_exp,
         )
 
     if result.get("status") != "error":

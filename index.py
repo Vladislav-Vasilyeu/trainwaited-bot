@@ -1,7 +1,9 @@
 import asyncio
-from html import escape
 import logging
+from collections import deque
 from datetime import datetime
+from html import escape
+from secrets import token_hex
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
@@ -15,12 +17,14 @@ from telegram.ext import (
     filters,
 )
 
-from config import CHECK_INTERVAL, TOKEN
+from config import CHECK_INTERVAL, MAX_CONCURRENT_CHECKS, TIMEZONE, TOKEN
 from scraper import (
     RailwayVerificationError,
+    StationLookupError,
     check_tickets,
     close_browser,
     fetch_trains_list,
+    search_stations,
 )
 import storage
 from storage import (
@@ -41,7 +45,7 @@ from ui import (
     MAIN_KEYBOARD,
     WELCOME_TEXT,
     cancel_keyboard,
-    date_quick_keyboard,
+    date_calendar_keyboard,
     delete_confirm_keyboard,
     format_subscription_created,
     format_subscriptions_list,
@@ -54,6 +58,8 @@ from ui import (
     retry_keyboard,
     seat_preference_keyboard,
     station_by_index,
+    station_suggestions_keyboard,
+    STATION_PAGE_SIZE,
     subscription_created_keyboard,
     subscriptions_list_keyboard,
     tickets_found_keyboard,
@@ -73,9 +79,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("selenium").setLevel(logging.WARNING)
 logging.getLogger("WDM").setLevel(logging.WARNING)
-
-load_subscriptions()
-
 
 async def send_or_edit(update: Update, text: str, reply_markup=None, parse_mode="HTML"):
     """Отправляет или редактирует сообщение в зависимости от типа update."""
@@ -112,6 +115,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     if update.message:
         await update.message.reply_text(HELP_TEXT, parse_mode="HTML", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
@@ -121,7 +125,7 @@ async def begin_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     text = (
         "📍 <b>Шаг 1 из 3</b> — станция отправления\n\n"
-        "Выберите из списка или введите название вручную:"
+        "Выберите популярную станцию или введите город/вокзал для поиска:"
     )
     markup = popular_stations_keyboard("from")
 
@@ -134,6 +138,128 @@ async def begin_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return FROM_STATION
 
 
+def _set_station(
+    context: ContextTypes.DEFAULT_TYPE,
+    prefix: str,
+    value: str,
+    label: str | None = None,
+    exp: str | None = None,
+) -> None:
+    context.user_data[f"{prefix}_station"] = value
+    context.user_data[f"{prefix}_station_label"] = label or value
+    context.user_data[f"{prefix}_station_exp"] = exp
+    context.user_data.pop(f"{prefix}_station_suggestions", None)
+    context.user_data.pop(f"{prefix}_station_query", None)
+    context.user_data.pop(f"{prefix}_station_search_id", None)
+
+
+def _station_label(context: ContextTypes.DEFAULT_TYPE, prefix: str) -> str:
+    return context.user_data.get(
+        f"{prefix}_station_label",
+        context.user_data.get(f"{prefix}_station", "—"),
+    )
+
+
+def _station_suggestions_text(
+    query: str, suggestions: list[dict[str, str]], page: int
+) -> str:
+    page_count = max(
+        1, (len(suggestions) + STATION_PAGE_SIZE - 1) // STATION_PAGE_SIZE
+    )
+    return (
+        f"🔎 По запросу <b>{escape(query)}</b> найдено вариантов: "
+        f"<b>{len(suggestions)}</b>.\n"
+        "Выберите нужный вокзал или станцию — особенно важно для крупных городов.\n"
+        f"Страница {page + 1} из {page_count}:"
+    )
+
+
+async def _search_station_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prefix: str,
+) -> int:
+    query_text = update.message.text.strip()
+    current_state = FROM_STATION if prefix == "from" else TO_STATION
+    context.user_data.pop(f"{prefix}_station_suggestions", None)
+    context.user_data.pop(f"{prefix}_station_query", None)
+    context.user_data.pop(f"{prefix}_station_search_id", None)
+    if len(query_text) < 2:
+        await update.message.reply_text(
+            "Введите не менее двух символов, чтобы найти станцию:",
+            reply_markup=cancel_keyboard(),
+        )
+        return current_state
+
+    progress = await update.message.reply_text(
+        f"🔎 Ищу станции по запросу «{escape(query_text)}» на сайте БЖД…",
+        parse_mode="HTML",
+    )
+    try:
+        suggestions = await search_stations(query_text)
+    except RailwayVerificationError:
+        await progress.edit_text(
+            "⚠️ Сайт БЖД временно показывает проверочную страницу. "
+            "Попробуйте ввести запрос ещё раз чуть позже.",
+            reply_markup=cancel_keyboard(),
+        )
+        return current_state
+    except StationLookupError:
+        await progress.edit_text(
+            "⚠️ Не удалось получить список станций с сайта БЖД. "
+            "Проверьте соединение и попробуйте ещё раз.",
+            reply_markup=cancel_keyboard(),
+        )
+        return current_state
+
+    if not suggestions:
+        await progress.edit_text(
+            f"Станции по запросу «{escape(query_text)}» не найдены.\n"
+            "Попробуйте другое написание или более короткий запрос.",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard(),
+        )
+        return current_state
+
+    context.user_data[f"{prefix}_station_query"] = query_text
+    context.user_data[f"{prefix}_station_suggestions"] = suggestions
+    search_id = token_hex(4)
+    context.user_data[f"{prefix}_station_search_id"] = search_id
+    await progress.edit_text(
+        _station_suggestions_text(query_text, suggestions, 0),
+        parse_mode="HTML",
+        reply_markup=station_suggestions_keyboard(suggestions, prefix, search_id),
+    )
+    return current_state
+
+
+async def _show_station_suggestions_page(
+    query, context: ContextTypes.DEFAULT_TYPE, prefix: str, page: int
+) -> int:
+    suggestions = context.user_data.get(f"{prefix}_station_suggestions", [])
+    query_text = context.user_data.get(f"{prefix}_station_query", "")
+    if not suggestions:
+        await query.edit_message_text(
+            "Список станций устарел. Введите запрос ещё раз:",
+            reply_markup=popular_stations_keyboard(prefix),
+        )
+        return FROM_STATION if prefix == "from" else TO_STATION
+
+    search_id = context.user_data.get(f"{prefix}_station_search_id", "")
+    page_count = max(
+        1, (len(suggestions) + STATION_PAGE_SIZE - 1) // STATION_PAGE_SIZE
+    )
+    page = max(0, min(page, page_count - 1))
+    await query.edit_message_text(
+        _station_suggestions_text(query_text, suggestions, page),
+        parse_mode="HTML",
+        reply_markup=station_suggestions_keyboard(
+            suggestions, prefix, search_id, page
+        ),
+    )
+    return FROM_STATION if prefix == "from" else TO_STATION
+
+
 async def get_from_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         query = update.callback_query
@@ -143,25 +269,66 @@ async def get_from_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "cancel_search":
             return await show_main_menu(update, context)
         if data == "from_manual":
+            context.user_data.pop("from_station_suggestions", None)
+            context.user_data.pop("from_station_search_id", None)
             await query.edit_message_text(
-                "✏️ Введите станцию отправления (например: <i>Минск-Пассажирский</i>):",
+                "✏️ Введите город или станцию отправления (например: <i>Москва</i>):",
                 parse_mode="HTML",
                 reply_markup=cancel_keyboard(),
             )
             return FROM_STATION
-        if data.startswith("from_"):
-            idx = int(data.replace("from_", ""))
-            context.user_data["from_station"] = station_by_index(idx)
+        if data.startswith("from_page_"):
+            try:
+                search_id, page_text = data.removeprefix("from_page_").rsplit("_", 1)
+                page = int(page_text)
+            except ValueError:
+                return FROM_STATION
+            if search_id != context.user_data.get("from_station_search_id"):
+                await query.edit_message_text(
+                    "Этот список станций устарел. Используйте последний результат поиска."
+                )
+                return FROM_STATION
+            return await _show_station_suggestions_page(query, context, "from", page)
+        if data.startswith("from_pick_"):
+            try:
+                search_id, index_text = data.removeprefix("from_pick_").rsplit("_", 1)
+                idx = int(index_text)
+                if search_id != context.user_data.get("from_station_search_id"):
+                    raise KeyError("Station search result is stale")
+                suggestions = context.user_data["from_station_suggestions"]
+                if idx < 0 or idx >= len(suggestions):
+                    raise IndexError("Station selection is out of range")
+                suggestion = suggestions[idx]
+            except (KeyError, IndexError, ValueError):
+                await query.edit_message_text(
+                    "Список станций устарел. Введите запрос ещё раз:",
+                    reply_markup=popular_stations_keyboard("from"),
+                )
+                return FROM_STATION
+            _set_station(
+                context,
+                "from",
+                suggestion["value"],
+                suggestion["label"],
+                suggestion["exp"],
+            )
+        elif data.startswith("from_"):
+            try:
+                idx = int(data.removeprefix("from_"))
+                station = station_by_index(idx)
+            except (IndexError, ValueError):
+                return FROM_STATION
+            _set_station(context, "from", station)
         else:
             return FROM_STATION
     else:
-        context.user_data["from_station"] = update.message.text.strip()
+        return await _search_station_input(update, context, "from")
 
-    from_st = context.user_data["from_station"]
+    from_st = _station_label(context, "from")
     text = (
         f"✅ Отправление: <b>{escape(from_st)}</b>\n\n"
         f"📍 <b>Шаг 2 из 3</b> — станция прибытия\n"
-        "Выберите из списка или введите вручную:"
+        "Выберите из списка или введите город/станцию для поиска:"
     )
     markup = popular_stations_keyboard("to")
 
@@ -174,11 +341,11 @@ async def get_from_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_to_station_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    from_st = context.user_data.get("from_station", "—")
+    from_st = _station_label(context, "from")
     text = (
         f"✅ Отправление: <b>{escape(from_st)}</b>\n\n"
         f"📍 <b>Шаг 2 из 3</b> — станция прибытия\n"
-        "Выберите из списка или введите вручную:"
+        "Выберите из списка или введите город/станцию для поиска:"
     )
     markup = popular_stations_keyboard("to")
     if update.callback_query:
@@ -197,27 +364,68 @@ async def get_to_station(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "cancel_search":
             return await show_main_menu(update, context)
         if data == "to_manual":
+            context.user_data.pop("to_station_suggestions", None)
+            context.user_data.pop("to_station_search_id", None)
             await query.edit_message_text(
-                "✏️ Введите станцию прибытия (например: <i>Брест-Центральный</i>):",
+                "✏️ Введите город или станцию прибытия (например: <i>Брест</i>):",
                 parse_mode="HTML",
                 reply_markup=cancel_keyboard(),
             )
             return TO_STATION
-        if data.startswith("to_"):
-            idx = int(data.replace("to_", ""))
-            context.user_data["to_station"] = station_by_index(idx)
+        if data.startswith("to_page_"):
+            try:
+                search_id, page_text = data.removeprefix("to_page_").rsplit("_", 1)
+                page = int(page_text)
+            except ValueError:
+                return TO_STATION
+            if search_id != context.user_data.get("to_station_search_id"):
+                await query.edit_message_text(
+                    "Этот список станций устарел. Используйте последний результат поиска."
+                )
+                return TO_STATION
+            return await _show_station_suggestions_page(query, context, "to", page)
+        if data.startswith("to_pick_"):
+            try:
+                search_id, index_text = data.removeprefix("to_pick_").rsplit("_", 1)
+                idx = int(index_text)
+                if search_id != context.user_data.get("to_station_search_id"):
+                    raise KeyError("Station search result is stale")
+                suggestions = context.user_data["to_station_suggestions"]
+                if idx < 0 or idx >= len(suggestions):
+                    raise IndexError("Station selection is out of range")
+                suggestion = suggestions[idx]
+            except (KeyError, IndexError, ValueError):
+                await query.edit_message_text(
+                    "Список станций устарел. Введите запрос ещё раз:",
+                    reply_markup=popular_stations_keyboard("to"),
+                )
+                return TO_STATION
+            _set_station(
+                context,
+                "to",
+                suggestion["value"],
+                suggestion["label"],
+                suggestion["exp"],
+            )
+        elif data.startswith("to_"):
+            try:
+                idx = int(data.removeprefix("to_"))
+                station = station_by_index(idx)
+            except (IndexError, ValueError):
+                return TO_STATION
+            _set_station(context, "to", station)
         else:
             return TO_STATION
     else:
-        context.user_data["to_station"] = update.message.text.strip()
+        return await _search_station_input(update, context, "to")
 
-    to_st = context.user_data["to_station"]
+    to_st = _station_label(context, "to")
     text = (
         f"✅ Прибытие: <b>{escape(to_st)}</b>\n\n"
         f"📅 <b>Шаг 3 из 3</b> — дата поездки\n"
-        "Выберите дату кнопкой или введите в формате <b>ДД.ММ.ГГГГ</b>:"
+        "Выберите дату в календаре или введите её в формате <b>ДД.ММ.ГГГГ</b>:"
     )
-    markup = date_quick_keyboard()
+    markup = date_calendar_keyboard()
 
     if update.callback_query:
         await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
@@ -233,8 +441,8 @@ async def process_date_and_search(update: Update, context: ContextTypes.DEFAULT_
 
     wait_text = (
         f"🔍 Ищу поезда на <b>{date_display}</b>\n"
-        f"📍 {escape(context.user_data['from_station'])} → "
-        f"{escape(context.user_data['to_station'])}\n\n"
+        f"📍 {escape(_station_label(context, 'from'))} → "
+        f"{escape(_station_label(context, 'to'))}\n\n"
         "⏳ Это может занять до 25 секунд..."
     )
 
@@ -248,6 +456,8 @@ async def process_date_and_search(update: Update, context: ContextTypes.DEFAULT_
             context.user_data["from_station"],
             context.user_data["to_station"],
             date_str,
+            from_exp=context.user_data.get("from_station_exp"),
+            to_exp=context.user_data.get("to_station_exp"),
         )
     except RailwayVerificationError:
         verification_text = (
@@ -304,13 +514,43 @@ async def process_date_and_search(update: Update, context: ContextTypes.DEFAULT_
 async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         query = update.callback_query
-        await query.answer()
         data = query.data
 
+        if data == "date_disabled":
+            await query.answer("Выберите сегодняшнюю или будущую дату.")
+            return DATE
+
+        await query.answer()
         if data == "cancel_search":
             return await show_main_menu(update, context)
         if data == "back_to_station":
             return await show_to_station_step(update, context)
+        if data.startswith("date_prev_") or data.startswith("date_next_"):
+            direction = "prev" if data.startswith("date_prev_") else "next"
+            month_text = data.removeprefix(f"date_{direction}_")
+            try:
+                year, month = (int(value) for value in month_text.split("-", 1))
+            except ValueError:
+                return DATE
+            if not 1 <= year <= 9999 or not 1 <= month <= 12:
+                return DATE
+            if direction == "prev":
+                month -= 1
+                if month == 0:
+                    year -= 1
+                    month = 12
+            else:
+                month += 1
+                if month == 13:
+                    year += 1
+                    month = 1
+            today = datetime.now(TIMEZONE).date()
+            if (year, month) < (today.year, today.month):
+                year, month = today.year, today.month
+            await query.edit_message_reply_markup(
+                reply_markup=date_calendar_keyboard(year, month, today)
+            )
+            return DATE
         if data == "date_manual":
             await query.edit_message_text(
                 "✏️ Введите дату в формате <b>ДД.ММ.ГГГГ</b> (например: 31.12.2026):",
@@ -319,18 +559,27 @@ async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return DATE
         if data.startswith("date_pick_"):
-            date_str = data.replace("date_pick_", "")
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            date_str = data.removeprefix("date_pick_")
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                return DATE
+            if dt.date() < datetime.now(TIMEZONE).date():
+                await query.edit_message_text(
+                    "Эта дата уже прошла. Выберите сегодняшнюю или будущую дату:",
+                    reply_markup=date_calendar_keyboard(),
+                )
+                return DATE
             return await process_date_and_search(update, context, date_str, dt.strftime("%d.%m.%Y"))
         return DATE
 
     date_text = update.message.text.strip()
     try:
         dt = datetime.strptime(date_text, "%d.%m.%Y")
-        if dt.date() < datetime.now().date():
+        if dt.date() < datetime.now(TIMEZONE).date():
             await update.message.reply_text(
                 "❌ Дата не может быть в прошлом. Попробуйте снова:",
-                reply_markup=cancel_keyboard(),
+                reply_markup=date_calendar_keyboard(),
             )
             return DATE
         return await process_date_and_search(update, context, dt.strftime("%Y-%m-%d"), date_text)
@@ -338,7 +587,7 @@ async def get_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Неверный формат. Используйте <b>ДД.ММ.ГГГГ</b> (например: 31.12.2026)",
             parse_mode="HTML",
-            reply_markup=cancel_keyboard(),
+            reply_markup=date_calendar_keyboard(),
         )
         return DATE
 
@@ -353,9 +602,9 @@ async def select_train(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_to_date":
         text = (
             f"📅 <b>Шаг 3 из 3</b> — дата поездки\n"
-            "Выберите дату кнопкой или введите в формате <b>ДД.ММ.ГГГГ</b>:"
+            "Выберите дату в календаре или введите её в формате <b>ДД.ММ.ГГГГ</b>:"
         )
-        await query.edit_message_text(text, reply_markup=date_quick_keyboard(), parse_mode="HTML")
+        await query.edit_message_text(text, reply_markup=date_calendar_keyboard(), parse_mode="HTML")
         return DATE
     if not data.startswith("select_train_"):
         return SELECT_TRAIN
@@ -451,6 +700,10 @@ async def select_preference(update: Update, context: ContextTypes.DEFAULT_TYPE):
         duration=train_info.get("duration", ""),
         car_type=car_type,
         seat_filter=seat_filter,
+        from_exp=context.user_data.get("from_station_exp"),
+        to_exp=context.user_data.get("to_station_exp"),
+        from_label=_station_label(context, "from"),
+        to_label=_station_label(context, "to"),
     )
 
     await query.edit_message_text(
@@ -483,6 +736,8 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
         train_num,
         car_type=sub.get("car_type"),
         seat_filter=sub.get("seat_filter"),
+        from_exp=sub.get("from_exp"),
+        to_exp=sub.get("to_exp"),
     )
     status = result["status"]
     schedule = train_schedule_label(sub)
@@ -590,28 +845,32 @@ async def check_single_subscription(context, user_id, sub, is_first_check=False,
 async def background_checker(context: ContextTypes.DEFAULT_TYPE):
     cleanup_expired()
     subs = list(active_subscriptions())
-    for i in range(0, len(subs), 3):
-        batch = subs[i : i + 3]
-        results = await asyncio.gather(
-            *[
-                check_single_subscription(context, int(uid), sub, is_first_check=False)
-                for uid, sub in batch
-            ],
-            return_exceptions=True,
-        )
-        for (uid, sub), result in zip(batch, results):
-            if isinstance(result, Exception):
+    if not subs:
+        return
+
+    pending = deque(subs)
+
+    async def worker() -> None:
+        while pending:
+            uid, sub = pending.popleft()
+            try:
+                await check_single_subscription(
+                    context, int(uid), sub, is_first_check=False
+                )
+            except Exception as error:
                 logging.error(
                     "Subscription check failed for subscription %s (user %s)",
                     sub.get("id"),
                     uid,
-                    exc_info=(type(result), result, result.__traceback__),
+                    exc_info=(type(error), error, error.__traceback__),
                 )
-        if i + 3 < len(subs):
-            await asyncio.sleep(0.5)
+
+    worker_count = min(MAX_CONCURRENT_CHECKS, len(subs))
+    await asyncio.gather(*(worker() for _ in range(worker_count)))
 
 
 async def show_user_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     user_id = update.effective_user.id
     subs = get_user_subs(user_id)
     text = format_subscriptions_list(subs)
@@ -698,6 +957,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
+    load_subscriptions()
     await application.bot.set_my_commands(BOT_COMMANDS)
 
 
@@ -707,6 +967,14 @@ async def post_shutdown(application: Application):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error("Exception while handling update", exc_info=context.error)
+
+
+def _conversation_menu_handlers() -> list[MessageHandler]:
+    return [
+        MessageHandler(filters.Regex(f"^{BTN_NEW_SEARCH}$"), begin_search),
+        MessageHandler(filters.Regex(f"^{BTN_MY_SUBS}$"), show_user_subscriptions),
+        MessageHandler(filters.Regex(f"^{BTN_HELP}$"), help_command),
+    ]
 
 
 def main():
@@ -730,21 +998,26 @@ def main():
         ],
         states={
             FROM_STATION: [
+                *_conversation_menu_handlers(),
                 CallbackQueryHandler(get_from_station, pattern="^(from_|cancel_search)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, get_from_station),
             ],
             TO_STATION: [
+                *_conversation_menu_handlers(),
                 CallbackQueryHandler(get_to_station, pattern="^(to_|cancel_search)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, get_to_station),
             ],
             DATE: [
+                *_conversation_menu_handlers(),
                 CallbackQueryHandler(get_date, pattern="^(date_|back_to_station|cancel_search)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, get_date),
             ],
             SELECT_TRAIN: [
+                *_conversation_menu_handlers(),
                 CallbackQueryHandler(select_train, pattern="^(select_train_|back_to_date|cancel_search)"),
             ],
             SELECT_PREFERENCE: [
+                *_conversation_menu_handlers(),
                 CallbackQueryHandler(
                     select_preference,
                     pattern="^(pref_|back_to_trains|cancel_search)",
@@ -753,6 +1026,10 @@ def main():
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
+            CommandHandler("help", help_command),
+            CommandHandler("my", show_user_subscriptions),
+            CommandHandler("my_subscription", show_user_subscriptions),
+            CommandHandler("search", begin_search),
             CallbackQueryHandler(show_main_menu, pattern="^cancel_search$"),
             CommandHandler("start", show_main_menu),
         ],

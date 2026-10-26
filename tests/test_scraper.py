@@ -1,14 +1,16 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 import scraper
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from scraper import (
     RailwayVerificationError,
+    StationLookupError,
     _route_url,
     _wait_for_schedule,
     count_matching_seats,
+    parse_station_suggestions,
 )
 from ui import parse_preference
 
@@ -54,6 +56,55 @@ class RouteUrlTests(unittest.TestCase):
             },
         )
 
+    def test_selected_station_codes_are_included_in_route_query(self):
+        url = _route_url(
+            "Москва Белорусская",
+            "Брест-Центральный",
+            "2026-12-31",
+            from_exp="2000006",
+            to_exp="2100001",
+        )
+        self.assertEqual(
+            parse_qs(urlparse(url).query),
+            {
+                "from": ["Москва Белорусская"],
+                "to": ["Брест-Центральный"],
+                "date": ["2026-12-31"],
+                "from_exp": ["2000006"],
+                "to_exp": ["2100001"],
+            },
+        )
+
+
+class StationSuggestionTests(unittest.TestCase):
+    def test_station_suggestions_keep_labels_values_and_station_codes(self):
+        suggestions = parse_station_suggestions(
+            [
+                {
+                    "label": "ст. Москва Белорусская, Россия",
+                    "value": "Москва Белорусская",
+                    "exp": "2000006",
+                },
+                {"label": "incomplete", "value": "incomplete"},
+                None,
+            ]
+        )
+
+        self.assertEqual(
+            suggestions,
+            [
+                {
+                    "label": "ст. Москва Белорусская, Россия",
+                    "value": "Москва Белорусская",
+                    "exp": "2000006",
+                }
+            ],
+        )
+
+    def test_invalid_suggestion_payload_is_reported(self):
+        with self.assertRaises(StationLookupError):
+            parse_station_suggestions({"unexpected": "payload"})
+
 
 class SeatPreferenceCallbackTests(unittest.TestCase):
     def test_all_preferences_parse_without_truncating_filter_names(self):
@@ -76,6 +127,42 @@ class SeatPreferenceCallbackTests(unittest.TestCase):
 
 
 class TicketCheckTests(unittest.IsolatedAsyncioTestCase):
+    async def test_station_search_reads_suggestions_from_the_page_widget(self):
+        page = AsyncMock()
+        page.title.return_value = "Schedule"
+        locator = AsyncMock()
+        page.locator = Mock(return_value=locator)
+        page.evaluate.return_value = [
+            {
+                "label": "ст. Москва Белорусская, Россия",
+                "value": "Москва Белорусская",
+                "exp": "2000006",
+            }
+        ]
+        context = AsyncMock()
+        context.new_page.return_value = page
+
+        with patch.object(scraper, "get_context", new_callable=AsyncMock, return_value=context):
+            results = await scraper.search_stations("Москва")
+
+        self.assertEqual(results[0]["exp"], "2000006")
+        page.locator.assert_called_once_with("#one-way-raspFormFromTitle")
+        locator.fill.assert_awaited_once_with("Москва")
+        page.wait_for_function.assert_awaited_once()
+        page.close.assert_awaited_once()
+
+    async def test_station_search_surfaces_verification_page(self):
+        page = AsyncMock()
+        page.title.return_value = "Verification"
+        context = AsyncMock()
+        context.new_page.return_value = page
+
+        with patch.object(scraper, "get_context", new_callable=AsyncMock, return_value=context):
+            with self.assertRaises(RailwayVerificationError):
+                await scraper.search_stations("Москва")
+
+        page.close.assert_awaited_once()
+
     async def test_ticket_check_reports_verification_as_page_error(self):
         page = AsyncMock()
         page.title.return_value = "Verification"
@@ -150,6 +237,31 @@ class TicketCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, empty_result)
         self.assertEqual(second, empty_result)
         self.assertEqual(check.await_count, 1)
+
+    async def test_cache_separates_different_station_codes(self):
+        empty_result = {"status": "no_tickets", "url": "", "items": [], "seats": {}}
+        with patch.object(
+            scraper,
+            "_check_tickets_sync",
+            new_callable=AsyncMock,
+            return_value=empty_result,
+        ) as check:
+            await scraper.check_tickets(
+                "unit-test-from",
+                "unit-test-to",
+                "2099-12-31",
+                "unit-test-station-codes",
+                from_exp="origin-a",
+            )
+            await scraper.check_tickets(
+                "unit-test-from",
+                "unit-test-to",
+                "2099-12-31",
+                "unit-test-station-codes",
+                from_exp="origin-b",
+            )
+
+        self.assertEqual(check.await_count, 2)
 
 
 if __name__ == "__main__":

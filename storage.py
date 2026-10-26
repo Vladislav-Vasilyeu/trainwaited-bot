@@ -5,7 +5,7 @@ import tempfile
 import uuid
 from datetime import datetime
 
-from config import SUBSCRIPTIONS_FILE
+from config import SUBSCRIPTIONS_FILE, TIMEZONE
 
 subscriptions: dict[str, list[dict]] = {}
 
@@ -104,6 +104,10 @@ def create_subscription(
     duration: str = "",
     car_type: str | None = None,
     seat_filter: str | None = None,
+    from_exp: str | None = None,
+    to_exp: str | None = None,
+    from_label: str | None = None,
+    to_label: str | None = None,
 ) -> dict:
     sub = {
         "id": str(uuid.uuid4())[:8],
@@ -111,6 +115,10 @@ def create_subscription(
         "date": date,
         "from": from_station,
         "to": to_station,
+        "from_label": from_label or from_station,
+        "to_label": to_label or to_station,
+        "from_exp": from_exp,
+        "to_exp": to_exp,
         "departure": departure,
         "arrival": arrival,
         "duration": duration,
@@ -125,7 +133,7 @@ def create_subscription(
 
 
 def cleanup_expired() -> None:
-    today = datetime.now().date()
+    today = datetime.now(TIMEZONE).date()
     changed = False
     for uid in list(subscriptions.keys()):
         active = []

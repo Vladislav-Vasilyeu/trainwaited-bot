@@ -1,9 +1,10 @@
-from datetime import datetime, timedelta
+from calendar import monthcalendar
+from datetime import date, datetime
 from html import escape
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
-from config import CHECK_INTERVAL, POPULAR_STATIONS
+from config import CHECK_INTERVAL, POPULAR_STATIONS, TIMEZONE
 
 # --- Reply keyboard ---
 
@@ -16,6 +17,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True,
 )
+
+STATION_PAGE_SIZE = 8
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -50,26 +53,148 @@ def popular_stations_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def date_quick_keyboard() -> InlineKeyboardMarkup:
-    today = datetime.now().date()
-    buttons = []
-    for label, offset in [("Сегодня", 0), ("Завтра", 1), ("+3 дня", 3), ("+7 дней", 7)]:
-        d = today + timedelta(days=offset)
-        buttons.append(
+def station_suggestions_keyboard(
+    suggestions: list[dict[str, str]], prefix: str, search_id: str, page: int = 0
+) -> InlineKeyboardMarkup:
+    page_count = max(
+        1, (len(suggestions) + STATION_PAGE_SIZE - 1) // STATION_PAGE_SIZE
+    )
+    page = max(0, min(page, page_count - 1))
+    start = page * STATION_PAGE_SIZE
+    rows = []
+    for index, suggestion in enumerate(
+        suggestions[start : start + STATION_PAGE_SIZE], start
+    ):
+        label = suggestion["label"]
+        if len(label) > 64:
+            label = f"{label[:61]}…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"{prefix}_pick_{search_id}_{index}",
+                )
+            ]
+        )
+
+    if page_count > 1:
+        navigation = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    "⬅️",
+                    callback_data=f"{prefix}_page_{search_id}_{page - 1}",
+                )
+            )
+        navigation.append(
             InlineKeyboardButton(
-                f"{label} ({d.strftime('%d.%m')})",
-                callback_data=f"date_pick_{d.strftime('%Y-%m-%d')}",
+                f"{page + 1}/{page_count}",
+                callback_data=f"{prefix}_page_{search_id}_{page}",
             )
         )
-    return InlineKeyboardMarkup(
+        if page < page_count - 1:
+            navigation.append(
+                InlineKeyboardButton(
+                    "➡️",
+                    callback_data=f"{prefix}_page_{search_id}_{page + 1}",
+                )
+            )
+        rows.append(navigation)
+
+    rows.extend(
         [
-            buttons[:2],
-            buttons[2:],
+            [InlineKeyboardButton("✏️ Другой запрос", callback_data=f"{prefix}_manual")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_search")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+_MONTH_NAMES = (
+    "январь",
+    "февраль",
+    "март",
+    "апрель",
+    "май",
+    "июнь",
+    "июль",
+    "август",
+    "сентябрь",
+    "октябрь",
+    "ноябрь",
+    "декабрь",
+)
+
+
+def date_calendar_keyboard(
+    year: int | None = None,
+    month: int | None = None,
+    today: date | None = None,
+) -> InlineKeyboardMarkup:
+    today = today or datetime.now(TIMEZONE).date()
+    year = year or today.year
+    month = month or today.month
+    current_month = (today.year, today.month)
+
+    previous_year, previous_month = year, month - 1
+    if previous_month == 0:
+        previous_year -= 1
+        previous_month = 12
+    next_year, next_month = year, month + 1
+    if next_month == 13:
+        next_year += 1
+        next_month = 1
+
+    previous_callback = (
+        f"date_prev_{year:04d}-{month:02d}"
+        if (previous_year, previous_month) >= current_month
+        else "date_disabled"
+    )
+    next_callback = (
+        f"date_next_{year:04d}-{month:02d}"
+        if year < 9999 or month < 12
+        else "date_disabled"
+    )
+    rows = [
+        [
+            InlineKeyboardButton("◀️", callback_data=previous_callback),
+            InlineKeyboardButton(
+                f"{_MONTH_NAMES[month - 1].capitalize()} {year}",
+                callback_data="date_disabled",
+            ),
+            InlineKeyboardButton("▶️", callback_data=next_callback),
+        ],
+        [
+            InlineKeyboardButton(day, callback_data="date_disabled")
+            for day in ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+        ],
+    ]
+
+    for week in monthcalendar(year, month):
+        row = []
+        for day in week:
+            if not day:
+                row.append(InlineKeyboardButton("·", callback_data="date_disabled"))
+                continue
+            selected_date = date(year, month, day)
+            callback = (
+                f"date_pick_{selected_date.isoformat()}"
+                if selected_date >= today
+                else "date_disabled"
+            )
+            row.append(
+                InlineKeyboardButton(str(day), callback_data=callback)
+            )
+        rows.append(row)
+
+    rows.extend(
+        [
             [InlineKeyboardButton("✏️ Ввести дату вручную", callback_data="date_manual")],
             [InlineKeyboardButton("◀️ Назад", callback_data="back_to_station")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel_search")],
         ]
     )
+    return InlineKeyboardMarkup(rows)
 
 
 def train_button_label(train: dict) -> str:
@@ -279,8 +404,10 @@ HELP_TEXT = (
     "/cancel — отменить текущий ввод\n"
     "/help — эта справка\n\n"
     "<b>Советы:</b>\n"
-    "• Пишите станции как на сайте БЖД (например: <i>Минск-Пассажирский</i>)\n"
+    "• Введите город или станцию — выберите точный вариант из списка БЖД "
+    "(для Москвы, например, конкретный вокзал)\n"
     "• Можно выбрать популярную станцию кнопкой\n"
+    "• Дату удобно выбрать в календаре; прошедшие дни недоступны\n"
     "• После создания подписки бот сразу делает первую проверку\n"
     "• Можно следить за конкретным типом места (например, нижнее в плацкарте)\n"
     "• Уведомление придёт один раз, когда билеты появятся\n"
@@ -307,10 +434,12 @@ def format_subscription(sub: dict) -> str:
         time_line += f" · №{escape(str(sub['train']))}"
     else:
         time_line = f"🚂 Поезд <b>{escape(str(sub['train']))}</b>"
+    from_label = sub.get("from_label", sub["from"])
+    to_label = sub.get("to_label", sub["to"])
     return (
         f"🆔 <code>{sub['id']}</code>\n"
         f"{time_line} · {sub['date'].replace('-', '.')}\n"
-        f"📍 {escape(str(sub['from']))} → {escape(str(sub['to']))}\n"
+        f"📍 {escape(str(from_label))} → {escape(str(to_label))}\n"
         f"{preference_label(sub)}\n"
         f"🔔 {status}"
     )
@@ -339,12 +468,15 @@ def format_subscription_created(sub: dict, date_display: str) -> str:
         schedule += f"\n🚂 Поезд №<b>{escape(str(sub['train']))}</b>"
     else:
         schedule = f"🚂 Поезд: <b>{escape(str(sub['train']))}</b>"
+    from_label = sub.get("from_label", sub["from"])
+    to_label = sub.get("to_label", sub["to"])
     return (
         f"✅ <b>Подписка создана!</b>\n\n"
         f"🆔 ID: <code>{escape(str(sub['id']))}</code>\n"
         f"{schedule}\n"
         f"📅 Дата: <b>{date_display}</b>\n"
-        f"📍 Маршрут: <b>{escape(str(sub['from']))}</b> → <b>{escape(str(sub['to']))}</b>\n"
+        f"📍 Маршрут: <b>{escape(str(from_label))}</b> → "
+        f"<b>{escape(str(to_label))}</b>\n"
         f"🎯 Отслеживаю: <b>{preference_label(sub).replace('🎯 ', '').replace('🎫 ', '')}</b>\n\n"
         f"⏰ Автопроверка каждые {CHECK_INTERVAL} сек\n"
         f"🔔 Уведомлю, как только появятся подходящие билеты!"
@@ -392,4 +524,6 @@ def format_tickets_message(
 
 
 def station_by_index(index: int) -> str:
+    if index < 0 or index >= len(POPULAR_STATIONS):
+        raise IndexError("Popular station index is out of range")
     return POPULAR_STATIONS[index]

@@ -43,6 +43,24 @@ class SubscriptionStorageTests(unittest.TestCase):
 
         self.assertEqual(storage.subscriptions, {})
 
+    def test_station_codes_and_display_labels_are_saved_with_subscription(self):
+        sub = storage.create_subscription(
+            "123",
+            "unit-test-train",
+            "2099-01-01",
+            "Москва Белорусская",
+            "Брест-Центральный",
+            from_exp="2000006",
+            to_exp="2100001",
+            from_label="ст. Москва Белорусская, Россия",
+            to_label="ст. Брест-Центральный",
+        )
+
+        self.assertEqual(sub["from_exp"], "2000006")
+        self.assertEqual(sub["to_exp"], "2100001")
+        self.assertEqual(sub["from_label"], "ст. Москва Белорусская, Россия")
+        self.assertEqual(sub["to_label"], "ст. Брест-Центральный")
+
 
 if __name__ == "__main__":
     unittest.main()
