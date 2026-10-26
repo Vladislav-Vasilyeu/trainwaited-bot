@@ -373,12 +373,16 @@ async def _check_tickets_sync(
 
     for attempt in range(1, retries + 1):
         page = None
+        stage = "starting browser"
         try:
             context = await get_context()
             page = await context.new_page()
+            stage = "loading timetable"
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            stage = "waiting for timetable"
             await _wait_for_schedule(page)
 
+            stage = "finding train"
             row = await _find_train_row(page, train_num)
             if not row:
                 return {"status": "train_not_found", "url": url, "items": [], "seats": {}}
@@ -406,6 +410,7 @@ async def _check_tickets_sync(
             seats: dict[str, int] = {}
             if seat_filter and seat_filter != "any":
                 code = car_type_code or ticket_items[0].get("car_type_code", "3")
+                stage = "reading seat details"
                 seats = await _fetch_seat_details(page, row, code)
                 matched = count_matching_seats(seats, seat_filter)
                 if matched <= 0:
@@ -429,8 +434,17 @@ async def _check_tickets_sync(
         except RailwayVerificationError:
             logging.warning("Ticket check blocked by railway-site verification")
             return {"status": "page_error", "url": url, "items": [], "seats": {}}
+        except PlaywrightTimeout:
+            logging.warning(
+                "Ticket check attempt %s timed out during %s", attempt, stage
+            )
         except Exception as e:
-            logging.warning("Ticket check attempt %s: %s", attempt, type(e).__name__)
+            logging.warning(
+                "Ticket check attempt %s failed during %s: %s",
+                attempt,
+                stage,
+                type(e).__name__,
+            )
         finally:
             if page:
                 await page.close()
@@ -452,12 +466,16 @@ async def _fetch_trains_sync(
 
     for attempt in range(1, retries + 1):
         page = None
+        stage = "starting browser"
         try:
             context = await get_context()
             page = await context.new_page()
+            stage = "loading timetable"
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            stage = "waiting for timetable"
             await _wait_for_schedule(page)
 
+            stage = "reading train list"
             trains = []
             for row in await page.query_selector_all(".sch-table__row-wrap"):
                 train = await _parse_train_row(row)
@@ -470,8 +488,17 @@ async def _fetch_trains_sync(
 
         except RailwayVerificationError:
             raise
+        except PlaywrightTimeout:
+            logging.warning(
+                "Train list attempt %s timed out during %s", attempt, stage
+            )
         except Exception as e:
-            logging.warning("Train list attempt %s: %s", attempt, type(e).__name__)
+            logging.warning(
+                "Train list attempt %s failed during %s: %s",
+                attempt,
+                stage,
+                type(e).__name__,
+            )
         finally:
             if page:
                 await page.close()

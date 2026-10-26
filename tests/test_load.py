@@ -8,6 +8,46 @@ from config import MAX_CONCURRENT_CHECKS
 
 
 class BackgroundCheckerLoadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_overlapping_checks_for_same_subscription_are_skipped(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def simulated_check(
+            context, user_id, sub, is_first_check=False, edit_message=None
+        ):
+            nonlocal calls
+            self.assertIsNotNone(context)
+            self.assertEqual(user_id, 123)
+            self.assertEqual(sub, subscription)
+            self.assertFalse(is_first_check)
+            self.assertIsNone(edit_message)
+            calls += 1
+            started.set()
+            await release.wait()
+
+        context = SimpleNamespace()
+        subscription = {"id": "same-subscription"}
+        key = ("123", "same-subscription")
+
+        with patch.object(index, "_check_single_subscription", new=simulated_check):
+            first_check = asyncio.create_task(
+                index.check_single_subscription(context, 123, subscription)
+            )
+            await started.wait()
+            await index.check_single_subscription(context, 123, subscription)
+
+            self.assertEqual(calls, 1)
+            self.assertIn(key, index._subscription_checks_in_progress)
+
+            release.set()
+            await first_check
+
+            self.assertNotIn(key, index._subscription_checks_in_progress)
+            await index.check_single_subscription(context, 123, subscription)
+
+        self.assertEqual(calls, 2)
+
     async def test_large_subscription_set_uses_bounded_workers(self):
         subscriptions = [
             (str(user_id), {"id": f"subscription-{user_id}"})

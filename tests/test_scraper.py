@@ -181,6 +181,28 @@ class TicketCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "page_error")
         page.close.assert_awaited_once()
 
+    async def test_ticket_check_logs_the_stage_that_timed_out(self):
+        page = AsyncMock()
+        page.goto.side_effect = PlaywrightTimeout("navigation timed out")
+        context = AsyncMock()
+        context.new_page.return_value = page
+
+        with (
+            patch.object(scraper, "get_context", new_callable=AsyncMock, return_value=context),
+            self.assertLogs(level="WARNING") as captured,
+        ):
+            result = await scraper._check_tickets_sync(
+                "unit-test-from",
+                "unit-test-to",
+                "2099-12-31",
+                "unit-test-train",
+                retries=1,
+            )
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("timed out during loading timetable", captured.output[0])
+        page.close.assert_awaited_once()
+
     async def test_verification_page_is_not_treated_as_an_empty_schedule(self):
         page = AsyncMock()
         page.title.return_value = "Verification"

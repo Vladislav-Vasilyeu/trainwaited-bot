@@ -68,6 +68,7 @@ from ui import (
 )
 
 FROM_STATION, TO_STATION, DATE, SELECT_TRAIN, SELECT_PREFERENCE = range(5)
+_subscription_checks_in_progress: set[tuple[str, str]] = set()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -721,6 +722,27 @@ async def select_preference(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_single_subscription(context, user_id, sub, is_first_check=False, edit_message=None):
+    key = (str(user_id), str(sub["id"]))
+    if key in _subscription_checks_in_progress:
+        logging.debug(
+            "Skipping overlapping check for subscription %s (user %s)",
+            key[1],
+            key[0],
+        )
+        return
+
+    _subscription_checks_in_progress.add(key)
+    try:
+        await _check_single_subscription(
+            context, user_id, sub, is_first_check, edit_message
+        )
+    finally:
+        _subscription_checks_in_progress.discard(key)
+
+
+async def _check_single_subscription(
+    context, user_id, sub, is_first_check=False, edit_message=None
+):
     train_num = sub["train"]
     date = sub["date"]
     from_st = sub["from"]
